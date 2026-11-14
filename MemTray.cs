@@ -331,6 +331,7 @@ namespace MemTray
 
     internal sealed class TrayApp : IDisposable
     {
+        internal const int TopCount = 10;         // 面板/菜单里显示的进程条数
         private const int HistoryCapacity = 1800; // 1s 一个采样点 = 30 分钟
 
         private readonly Config _cfg;
@@ -417,7 +418,7 @@ namespace MemTray
 
                 if (_panel.Visible)
                 {
-                    if ((_ticks % 2) == 0) _top = TakeSnapshot(5);
+                    if ((_ticks % 2) == 0) _top = TakeSnapshot(TopCount);
                     _panel.SetData(_mem, _top, _alerts, _history, _cfg, _self.PrivateMemorySize64 / 1048576.0);
                 }
             }
@@ -708,7 +709,7 @@ namespace MemTray
         private void ShowPanel()
         {
             if (_mem == null) _mem = SampleMemory();
-            _top = TakeSnapshot(5);
+            _top = TakeSnapshot(TopCount);
             _panel.SetData(_mem, _top, _alerts, _history, _cfg, _self.PrivateMemorySize64 / 1048576.0);
             PositionPanel();
             _panel.Show();
@@ -904,7 +905,7 @@ namespace MemTray
                 if (_top.Count > 0)
                 {
                     _menu.Items.Add(new ToolStripSeparator());
-                    for (int i = 0; i < _top.Count && i < 5; i++)
+                    for (int i = 0; i < _top.Count && i < TopCount; i++)
                     {
                         ProcRow r = _top[i];
                         long b = r.Metric(_cfg.UsePrivateMetric);
@@ -944,7 +945,7 @@ namespace MemTray
             {
                 _cfg.UsePrivateMetric = !_cfg.UsePrivateMetric;
                 _cfg.Save();
-                _top = TakeSnapshot(5);
+                _top = TakeSnapshot(TopCount);
                 if (_panel.Visible)
                     _panel.SetData(_mem, _top, _alerts, _history, _cfg, _self.PrivateMemorySize64 / 1048576.0);
             };
@@ -1038,7 +1039,7 @@ namespace MemTray
                 _scale = g.DpiX / 96f;
             if (_scale < 1f) _scale = 1f;
 
-            ClientSize = new Size((int)(400 * _scale), (int)(372 * _scale));
+            ClientSize = new Size((int)(400 * _scale), (int)((372 + (TrayApp.TopCount - 5) * 24) * _scale));
             CreateFonts();
             ApplyRegion();
         }
@@ -1144,7 +1145,7 @@ namespace MemTray
             DrawStats(g, s, pad, w);
             DrawChart(g, s, pad, w);
 
-            DrawText(g, "占用最大 5 个程序", _fSection, CText, pad, 206f * s);
+            DrawText(g, string.Format(CultureInfo.InvariantCulture, "占用最大 {0} 个程序", TrayApp.TopCount), _fSection, CText, pad, 206f * s);
             DrawTextRight(g, _cfg != null && _cfg.UsePrivateMetric ? "口径：专用内存" : "口径：工作集",
                 _fMeta, CDim, w - pad, 209f * s);
 
@@ -1187,8 +1188,8 @@ namespace MemTray
                 {
                     float yy = rect.Bottom - rect.Height * (q * 25f / 100f);
                     g.DrawLine(grid, rect.Left + 1, yy, rect.Right - 1, yy);
-                    DrawText(g, (q * 25).ToString(CultureInfo.InvariantCulture) + "%", _fMeta,
-                        Color.FromArgb(72, CDim), rect.Left + 4 * s, yy - 12 * s);
+                    DrawTextRight(g, (q * 25).ToString(CultureInfo.InvariantCulture) + "%", _fMeta,
+                        Color.FromArgb(72, CDim), rect.Right - 4 * s, yy - 12 * s);
                 }
             }
 
@@ -1254,7 +1255,12 @@ namespace MemTray
                 spanText += string.Format(CultureInfo.InvariantCulture, " · 峰 {0:0.0}% · 谷 {1:0.0}%", peak, valley);
             if (th > 0 && th <= 100)
                 spanText += " · 阈值 " + th.ToString("0", CultureInfo.InvariantCulture) + "%";
-            DrawText(g, spanText, _fMeta, Color.FromArgb(110, CDim), rect.Left + 6 * s, rect.Top + 4 * s);
+            SizeF ts = g.MeasureString(spanText, _fMeta);
+            RectangleF chip = new RectangleF(rect.Left + 4 * s, rect.Top + 3 * s, ts.Width + 6 * s, ts.Height);
+            using (GraphicsPath cp = TrayApp.RoundRectPublic(chip, 4f * s))
+            using (SolidBrush cb = new SolidBrush(Color.FromArgb(190, 18, 23, 30)))
+                g.FillPath(cb, cp);
+            DrawText(g, spanText, _fMeta, Color.FromArgb(190, CDim), chip.X + 3 * s, chip.Y);
         }
 
         private void DrawRows(Graphics g, float s, float pad, float w)
@@ -1264,7 +1270,7 @@ namespace MemTray
             double total = _mem == null || _mem.Total == 0 ? 1 : (double)_mem.Total;
             bool priv = _cfg != null && _cfg.UsePrivateMetric;
 
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < TrayApp.TopCount; i++)
             {
                 float y = y0 + i * rowH;
                 using (Pen sep = new Pen(Color.FromArgb(20, 255, 255, 255), 1f))
@@ -1340,7 +1346,7 @@ namespace MemTray
             }
 
             DrawText(g, Fit(g, text, _fFooter, w - 2 * pad), _fFooter,
-                Color.FromArgb(140, CDim), pad, 350f * s);
+                Color.FromArgb(140, CDim), pad, (350f + (TrayApp.TopCount - 5) * 24) * s);
         }
 
         // ---------- 绘制辅助 ----------

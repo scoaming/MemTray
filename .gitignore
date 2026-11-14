@@ -1,0 +1,6 @@
+# 构建产物
+MemTray.exe
+app.ico
+
+# 本地截图
+shot_*.png

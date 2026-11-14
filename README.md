@@ -107,7 +107,9 @@ metric=ws               # ws = 工作集（任务管理器"内存"列），priva
 无需安装 .NET SDK，用系统自带的 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`：
 
 ```powershell
-pwsh -NoProfile -File C:\Users\ist\memtray\build.ps1
+git clone https://github.com/scoaming/MemTray.git
+cd MemTray
+pwsh -NoProfile -File .\build.ps1
 ```
 
 脚本会先结束正在运行的实例（否则 exe 被占用无法覆盖），重画 `app.ico`，再编译出 `MemTray.exe`（约 36 KB）。
@@ -122,6 +124,8 @@ pwsh -NoProfile -File C:\Users\ist\memtray\build.ps1
 | `app.manifest` | asInvoker + 启用 DPI 感知 + Win10/11 supportedOS |
 | `build.ps1` | 生成图标 + 调 csc 编译 |
 | `MemTray.exe` | 产物 |
+
+也可以直接下载现成的 exe：[Release v1.0.0](https://github.com/scoaming/MemTray/releases/latest)。
 
 ---
 

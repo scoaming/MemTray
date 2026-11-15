@@ -118,6 +118,29 @@ namespace MemTray
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool GetProcessMemoryInfo(IntPtr hProcess, out PROCESS_MEMORY_COUNTERS_EX counters, uint size);
 
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct PERFORMANCE_INFORMATION
+        {
+            internal uint cb;
+            internal IntPtr CommitTotal;
+            internal IntPtr CommitLimit;
+            internal IntPtr CommitPeak;
+            internal IntPtr PhysicalTotal;
+            internal IntPtr PhysicalAvailable;
+            internal IntPtr SystemCache;
+            internal IntPtr KernelTotal;
+            internal IntPtr KernelPaged;
+            internal IntPtr KernelNonpaged;
+            internal IntPtr PageSize;
+            internal uint HandleCount;
+            internal uint ProcessCount;
+            internal uint ThreadCount;
+        }
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetPerformanceInfo(out PERFORMANCE_INFORMATION info, uint size);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         internal static extern IntPtr OpenProcess(uint access, bool inheritHandle, int processId);
 
@@ -384,6 +407,8 @@ namespace MemTray
             _timer.Interval = 1000;
             _timer.Tick += TimerTick;
             _timer.Start();
+
+
 
             _showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\MemTray.ShowPanel");
             _registeredWait = ThreadPool.RegisterWaitForSingleObject(_showEvent, ShowSignal, null, Timeout.Infinite, false);
@@ -924,6 +949,10 @@ namespace MemTray
             panelItem.Click += delegate { ShowPanel(); };
             _menu.Items.Add(panelItem);
 
+            ToolStripMenuItem breakdownItem = new ToolStripMenuItem("查看内存构成…");
+            breakdownItem.Click += delegate { ShowBreakdown(); };
+            _menu.Items.Add(breakdownItem);
+
             ToolStripMenuItem snap = new ToolStripMenuItem("立即快照并记录");
             snap.Click += delegate { ManualSnapshot(); };
             _menu.Items.Add(snap);
@@ -981,6 +1010,23 @@ namespace MemTray
             catch (Exception) { }
         }
 
+        private void ShowBreakdown()
+        {
+            try
+            {
+                MemBreakdown b = MemBreakdown.Collect();
+                BreakdownForm f = new BreakdownForm(b);
+                f.Show();
+                f.TopMost = false;
+                f.TopMost = true;
+                Native.SetForegroundWindow(f.Handle);
+            }
+            catch (Exception ex)
+            {
+                Log.Write(ex);
+            }
+        }
+
         // ---------- 清理 ----------
 
         public void Dispose()
@@ -1001,6 +1047,247 @@ namespace MemTray
             catch (Exception) { }
             try { if (_self != null) _self.Dispose(); }
             catch (Exception) { }
+        }
+    }
+
+    internal sealed class MemBreakdown
+    {
+        internal DateTime Time;
+        internal double TotalGB;
+        internal double AvailGB;
+        internal double UsedGB;
+        internal double Percent;
+        internal double ProcessGB;
+        internal double CompressionGB;
+        internal double KernelGB;
+        internal double KernelPagedGB;
+        internal double KernelNonpagedGB;
+        internal double OtherGB;
+        internal double CommitUsedGB;
+        internal double CommitLimitGB;
+        internal int ProcessCount;
+        internal int ThreadCount;
+        internal int HandleCount;
+
+        internal static MemBreakdown Collect()
+        {
+            MemBreakdown b = new MemBreakdown();
+            b.Time = DateTime.Now;
+
+            Native.MEMORYSTATUSEX m = new Native.MEMORYSTATUSEX();
+            if (Native.GlobalMemoryStatusEx(m))
+            {
+                b.TotalGB = m.ullTotalPhys / 1073741824.0;
+                b.AvailGB = m.ullAvailPhys / 1073741824.0;
+                b.UsedGB = (m.ullTotalPhys - m.ullAvailPhys) / 1073741824.0;
+                if (m.ullTotalPhys > 0)
+                    b.Percent = (m.ullTotalPhys - m.ullAvailPhys) * 100.0 / m.ullTotalPhys;
+                if (m.ullTotalPageFile > m.ullAvailPageFile)
+                {
+                    b.CommitUsedGB = (m.ullTotalPageFile - m.ullAvailPageFile) / 1073741824.0;
+                    b.CommitLimitGB = m.ullTotalPageFile / 1073741824.0;
+                }
+            }
+
+            Native.PERFORMANCE_INFORMATION pi;
+            if (Native.GetPerformanceInfo(out pi, (uint)Marshal.SizeOf(typeof(Native.PERFORMANCE_INFORMATION))))
+            {
+                long page = pi.PageSize.ToInt64();
+                if (page <= 0) page = 4096;
+                b.KernelNonpagedGB = pi.KernelNonpaged.ToInt64() * (double)page / 1073741824.0;
+                b.KernelPagedGB = pi.KernelPaged.ToInt64() * (double)page / 1073741824.0;
+                b.KernelGB = b.KernelPagedGB + b.KernelNonpagedGB;
+                b.ProcessCount = (int)pi.ProcessCount;
+                b.ThreadCount = (int)pi.ThreadCount;
+                b.HandleCount = (int)pi.HandleCount;
+            }
+
+            Process[] ps = Process.GetProcesses();
+            long sum = 0;
+            long comp = 0;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                Process p = ps[i];
+                try
+                {
+                    long ws = p.WorkingSet64;
+                    sum += ws;
+                    if (comp == 0 && p.ProcessName == "Memory Compression") comp = ws;
+                }
+                catch (Exception) { }
+                finally { p.Dispose(); }
+            }
+            b.ProcessGB = sum / 1073741824.0;
+            b.CompressionGB = comp / 1073741824.0;
+            if (b.ProcessCount <= 0) b.ProcessCount = ps.Length;
+
+            b.OtherGB = b.UsedGB - b.ProcessGB - b.KernelGB;
+            if (b.OtherGB < 0) b.OtherGB = 0;
+            return b;
+        }
+    }
+
+    internal sealed class BreakdownForm : Form
+    {
+        private static readonly Color CText = Color.FromArgb(232, 234, 237);
+        private static readonly Color CDim = Color.FromArgb(154, 160, 166);
+        private static readonly Color CLine = Color.FromArgb(48, 55, 68);
+
+        private readonly MemBreakdown _b;
+        private readonly float _scale;
+        private readonly Font _fTitle;
+        private readonly Font _fBig;
+        private readonly Font _fRow;
+        private readonly Font _fMeta;
+        private DateTime _shownUtc = DateTime.MinValue;
+
+        internal BreakdownForm(MemBreakdown b)
+        {
+            _b = b;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer, true);
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            BackColor = Color.FromArgb(26, 30, 38);
+            Text = "内存构成";
+
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+                _scale = g.DpiX / 96f;
+            if (_scale < 1f) _scale = 1f;
+
+            ClientSize = new Size((int)(380 * _scale), (int)(322 * _scale));
+            _fTitle = new Font("Microsoft YaHei UI", 17f * _scale, FontStyle.Bold, GraphicsUnit.Pixel);
+            _fBig = new Font("Microsoft YaHei UI", 18f * _scale, FontStyle.Bold, GraphicsUnit.Pixel);
+            _fRow = new Font("Microsoft YaHei UI", 12f * _scale, FontStyle.Regular, GraphicsUnit.Pixel);
+            _fMeta = new Font("Microsoft YaHei UI", 10.5f * _scale, FontStyle.Regular, GraphicsUnit.Pixel);
+
+            using (GraphicsPath p = TrayApp.RoundRectPublic(new RectangleF(0, 0, Width, Height), 12f * _scale))
+                Region = new Region(p);
+
+            Rectangle wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Location = new Point(wa.Left + (wa.Width - Width) / 2, wa.Top + (wa.Height - Height) / 2);
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x00000080;   // WS_EX_TOOLWINDOW
+                cp.ClassStyle |= 0x00020000; // CS_DROPSHADOW
+                return cp;
+            }
+        }
+
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            // 从右键菜单打开时，菜单收起会先触发一次 Deactivate，这里跳过最初 0.5 秒
+            if ((DateTime.UtcNow - _shownUtc).TotalMilliseconds < 500) return;
+            Close();
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            _shownUtc = DateTime.UtcNow;
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == Keys.Escape) { Close(); return true; }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            float s = _scale;
+            float w = ClientSize.Width;
+            float h = ClientSize.Height;
+            float pad = 16f * s;
+
+            using (SolidBrush bg = new SolidBrush(Color.FromArgb(26, 30, 38)))
+                g.FillRectangle(bg, ClientRectangle);
+            using (Pen border = new Pen(Color.FromArgb(62, 70, 88), 1f))
+                g.DrawRectangle(border, 0.5f, 0.5f, w - 1f, h - 1f);
+
+            Txt(g, "内存构成", _fTitle, CText, pad, 13 * s);
+            TxtRight(g, _b.Time.ToString("HH:mm:ss"), _fMeta, CDim, w - pad, 17 * s);
+
+            string used = "已用 " + Fmt.Gb(_b.UsedGB);
+            Txt(g, used, _fBig, CText, pad, 40 * s);
+            float uw = g.MeasureString(used, _fBig).Width;
+            Txt(g, "/ " + Fmt.Gb(_b.TotalGB) + "   " +
+                _b.Percent.ToString("0.0", CultureInfo.InvariantCulture) + "%",
+                _fRow, CDim, pad + uw, 50 * s);
+
+            Line(g, pad, 76 * s, w - pad, 76 * s);
+
+            float y = 86 * s;
+            float rowH = 26 * s;
+            Row(g, "进程（工作集）", Fmt.Gb(_b.ProcessGB), CText, pad, w, y, s);
+            Row(g, "　其中 内存压缩", Fmt.Gb(_b.CompressionGB), CDim, pad, w, y + rowH, s);
+            Row(g, "内核池", Fmt.Gb(_b.KernelGB), CText, pad, w, y + rowH * 2, s);
+            Row(g, "　非分页 / 分页", _b.KernelNonpagedGB.ToString("0.00", CultureInfo.InvariantCulture) +
+                " / " + _b.KernelPagedGB.ToString("0.00", CultureInfo.InvariantCulture) + " GB",
+                CDim, pad, w, y + rowH * 3, s);
+            Row(g, "其他（共享页 / 缓存 / 驱动）", Fmt.Gb(_b.OtherGB), CText, pad, w, y + rowH * 4, s);
+            Row(g, "可用", Fmt.Gb(_b.AvailGB), CText, pad, w, y + rowH * 5, s);
+
+            Line(g, pad, 248 * s, w - pad, 248 * s);
+            Txt(g, string.Format(CultureInfo.InvariantCulture, "{0} 进程 · {1} 线程 · {2} 句柄",
+                _b.ProcessCount, _b.ThreadCount, _b.HandleCount), _fMeta, CDim, pad, 256 * s);
+            Txt(g, "提交 " + Fmt.Gb(_b.CommitUsedGB) + " / " + Fmt.Gb(_b.CommitLimitGB),
+                _fMeta, CDim, pad, 272 * s);
+            Txt(g, "工作集合计含共享页；系统修剪工作集时，进程行变小、其他行变大", _fMeta,
+                Color.FromArgb(150, CDim), pad, 292 * s);
+        }
+
+        private void Row(Graphics g, string label, string value, Color color, float pad, float w, float y, float s)
+        {
+            Txt(g, label, _fRow, color, pad, y);
+            TxtRight(g, value, _fRow, color, w - pad, y);
+        }
+
+        private static void Txt(Graphics g, string text, Font f, Color c, float x, float y)
+        {
+            using (SolidBrush b = new SolidBrush(c))
+                g.DrawString(text, f, b, x, y);
+        }
+
+        private static void TxtRight(Graphics g, string text, Font f, Color c, float right, float y)
+        {
+            SizeF sz = g.MeasureString(text, f);
+            using (SolidBrush b = new SolidBrush(c))
+                g.DrawString(text, f, b, right - sz.Width, y);
+        }
+
+        private static void Line(Graphics g, float x1, float y1, float x2, float y2)
+        {
+            using (Pen p = new Pen(CLine, 1f))
+                g.DrawLine(p, x1, y1, x2, y2);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (_fTitle != null) _fTitle.Dispose();
+                if (_fBig != null) _fBig.Dispose();
+                if (_fRow != null) _fRow.Dispose();
+                if (_fMeta != null) _fMeta.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 

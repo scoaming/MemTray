@@ -112,11 +112,85 @@ namespace MemTray
             internal UIntPtr PagefileUsage;
             internal UIntPtr PeakPagefileUsage;
             internal UIntPtr PrivateUsage;
+            internal UIntPtr PrivateWorkingSetSize;
+            internal UIntPtr SharedCommitUsage;
         }
 
         [DllImport("psapi.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool GetProcessMemoryInfo(IntPtr hProcess, out PROCESS_MEMORY_COUNTERS_EX counters, uint size);
+
+        // 一次系统调用拿到全部进程的「专用工作集」，不依赖 OpenProcess 权限
+        // （svchost 之类受保护进程用 GetProcessMemoryInfo 打不开）。
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct UNICODE_STRING
+        {
+            internal ushort Length;
+            internal ushort MaximumLength;
+            internal IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct SYSTEM_PROCESS_INFORMATION
+        {
+            internal uint NextEntryOffset;
+            internal uint NumberOfThreads;
+            internal long WorkingSetPrivateSize;
+            internal uint HardFaultCount;
+            internal uint NumberOfThreadsHighWatermark;
+            internal ulong CycleTime;
+            internal long CreateTime;
+            internal long UserTime;
+            internal long KernelTime;
+            internal UNICODE_STRING ImageName;
+            internal int BasePriority;
+            internal IntPtr UniqueProcessId;
+            internal IntPtr InheritedFromUniqueProcessId;
+        }
+
+        [DllImport("ntdll.dll")]
+        internal static extern int NtQuerySystemInformation(int infoClass, IntPtr buffer, int length, out int returnLength);
+
+        internal static Dictionary<int, long> QueryPrivateWorkingSet()
+        {
+            Dictionary<int, long> map = new Dictionary<int, long>();
+            int len = 1 << 21;
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                IntPtr buf = IntPtr.Zero;
+                try
+                {
+                    buf = Marshal.AllocHGlobal(len);
+                    int ret;
+                    int status = NtQuerySystemInformation(5 /* SystemProcessInformation */, buf, len, out ret);
+                    if (status == unchecked((int)0xC0000004))   // STATUS_INFO_LENGTH_MISMATCH
+                    {
+                        len = Math.Max(ret + 65536, len * 2);
+                        continue;
+                    }
+                    if (status != 0) return map;
+
+                    int structSize = Marshal.SizeOf(typeof(SYSTEM_PROCESS_INFORMATION));
+                    long ptr = buf.ToInt64();
+                    while (true)
+                    {
+                        SYSTEM_PROCESS_INFORMATION spi = (SYSTEM_PROCESS_INFORMATION)Marshal.PtrToStructure(
+                            new IntPtr(ptr), typeof(SYSTEM_PROCESS_INFORMATION));
+                        int pid = spi.UniqueProcessId.ToInt32();
+                        if (pid > 0) map[pid] = spi.WorkingSetPrivateSize;
+                        if (spi.NextEntryOffset == 0) break;
+                        ptr += spi.NextEntryOffset;
+                    }
+                    return map;
+                }
+                catch (Exception) { return map; }
+                finally
+                {
+                    if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
+                }
+            }
+            return map;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct PERFORMANCE_INFORMATION
@@ -199,13 +273,16 @@ namespace MemTray
         internal int Count;
         internal long WsBytes;
         internal long PrivateBytes;
+        internal long PwsBytes;
         internal double CpuPercent;
         internal double CpuSeconds;
         internal long CpuTicks;
 
-        internal long Metric(bool usePrivate)
+        internal long Metric(string mode)
         {
-            return usePrivate ? PrivateBytes : WsBytes;
+            if (mode == "private") return PrivateBytes;
+            if (mode == "pws") return PwsBytes;
+            return WsBytes;
         }
     }
 
@@ -215,7 +292,7 @@ namespace MemTray
         internal MemInfo Mem;
         internal List<ProcRow> Top;
         internal string Reason;
-        internal bool MetricPrivate;
+        internal string Mode;
     }
 
     internal static class Fmt
@@ -239,7 +316,7 @@ namespace MemTray
         internal double AlertAvailGB = 1.5;
         internal int AlertSustainSeconds = 10;
         internal int CooldownSeconds = 300;
-        internal bool UsePrivateMetric = false;
+        internal string Metric = "ws";   // ws / private / pws
 
         internal static string DataDir
         {
@@ -286,7 +363,10 @@ namespace MemTray
                             if (int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) c.CooldownSeconds = n;
                             break;
                         case "metric":
-                            c.UsePrivateMetric = v.Equals("private", StringComparison.OrdinalIgnoreCase);
+                            string mv = v.ToLowerInvariant();
+                            if (mv == "private") c.Metric = "private";
+                            else if (mv == "pws") c.Metric = "pws";
+                            else c.Metric = "ws";
                             break;
                     }
                 }
@@ -305,12 +385,12 @@ namespace MemTray
                 sb.AppendLine("# alert_avail_gb : 可用物理内存低于该值即视为越线");
                 sb.AppendLine("# sustain_seconds: 越线持续多少秒才告警");
                 sb.AppendLine("# cooldown_seconds: 两次告警的最小间隔");
-                sb.AppendLine("# metric         : ws=工作集(默认) / private=专用内存");
+                sb.AppendLine("# metric         : ws=工作集(默认) / private=专用内存(提交) / pws=专用工作集(同任务管理器)");
                 sb.AppendLine("alert_percent=" + AlertPercent.ToString("0.0", CultureInfo.InvariantCulture));
                 sb.AppendLine("alert_avail_gb=" + AlertAvailGB.ToString("0.0", CultureInfo.InvariantCulture));
                 sb.AppendLine("sustain_seconds=" + AlertSustainSeconds.ToString(CultureInfo.InvariantCulture));
                 sb.AppendLine("cooldown_seconds=" + CooldownSeconds.ToString(CultureInfo.InvariantCulture));
-                sb.AppendLine("metric=" + (UsePrivateMetric ? "private" : "ws"));
+                sb.AppendLine("metric=" + Metric);
                 File.WriteAllText(ConfigPath, sb.ToString(), new UTF8Encoding(true));
             }
             catch (Exception) { }
@@ -354,7 +434,13 @@ namespace MemTray
 
     internal sealed class TrayApp : IDisposable
     {
-        internal const int TopCount = 10;         // 面板/菜单里显示的进程条数
+        internal const int TopCount = 10;
+        internal static string MetricName(string mode)
+        {
+            if (string.Equals(mode, "private", StringComparison.OrdinalIgnoreCase)) return "专用内存";
+            if (string.Equals(mode, "pws", StringComparison.OrdinalIgnoreCase)) return "专用工作集";
+            return "工作集";
+        }         // 面板/菜单里显示的进程条数
         private const int HistoryCapacity = 1800; // 1s 一个采样点 = 30 分钟
 
         private readonly Config _cfg;
@@ -514,6 +600,7 @@ namespace MemTray
             internal int Count;
             internal long Ws;
             internal long Private;
+            internal long Pws;
             internal long CpuTicks;
         }
 
@@ -525,6 +612,7 @@ namespace MemTray
             _prevProcStamp = nowStamp;
 
             Dictionary<string, Agg> map = new Dictionary<string, Agg>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<int, long> pwsMap = Native.QueryPrivateWorkingSet();
             Process[] procs = null;
             try { procs = Process.GetProcesses(); }
             catch (Exception) { return new List<ProcRow>(); }
@@ -552,8 +640,11 @@ namespace MemTray
                         try { ws = p.WorkingSet64; priv = ws; }
                         catch (Exception) { ws = 0; priv = 0; }
                     }
+                    long pws;
+                    if (!pwsMap.TryGetValue(p.Id, out pws) || pws <= 0) pws = ws;
                     a.Ws += ws;
                     a.Private += priv;
+                    a.Pws += pws;
 
                     try { a.CpuTicks += p.TotalProcessorTime.Ticks; }
                     catch (Exception) { }
@@ -570,6 +661,7 @@ namespace MemTray
                 r.Count = a.Count;
                 r.WsBytes = a.Ws;
                 r.PrivateBytes = a.Private;
+                r.PwsBytes = a.Pws;
                 r.CpuTicks = a.CpuTicks;
                 r.CpuSeconds = a.CpuTicks / 10000000.0;
 
@@ -586,10 +678,10 @@ namespace MemTray
             _prevCpuTicks.Clear();
             foreach (Agg a in map.Values) _prevCpuTicks[a.Name] = a.CpuTicks;
 
-            bool usePriv = _cfg.UsePrivateMetric;
+            string mode = _cfg.Metric;
             rows.Sort(delegate(ProcRow x, ProcRow y)
             {
-                return y.Metric(usePriv).CompareTo(x.Metric(usePriv));
+                return y.Metric(mode).CompareTo(x.Metric(mode));
             });
             if (rows.Count > topN) rows.RemoveRange(topN, rows.Count - topN);
             return rows;
@@ -607,7 +699,13 @@ namespace MemTray
 
                 Native.PROCESS_MEMORY_COUNTERS_EX c = new Native.PROCESS_MEMORY_COUNTERS_EX();
                 c.cb = (uint)Marshal.SizeOf(typeof(Native.PROCESS_MEMORY_COUNTERS_EX));
-                if (!Native.GetProcessMemoryInfo(h, out c, c.cb)) return false;
+                if (!Native.GetProcessMemoryInfo(h, out c, c.cb))
+                {
+                    // 老系统不认识 EX2 结构（cb 变大了），退回 EX 的 80 字节
+                    c = new Native.PROCESS_MEMORY_COUNTERS_EX();
+                    c.cb = 80;
+                    if (!Native.GetProcessMemoryInfo(h, out c, c.cb)) return false;
+                }
 
                 ws = (long)c.WorkingSetSize.ToUInt64();
                 priv = (long)c.PrivateUsage.ToUInt64();
@@ -779,7 +877,7 @@ namespace MemTray
             rec.Mem = _mem;
             rec.Top = top;
             rec.Reason = reason;
-            rec.MetricPrivate = _cfg.UsePrivateMetric;
+            rec.Mode = _cfg.Metric;
 
             _alerts.Insert(0, rec);
             while (_alerts.Count > 20) _alerts.RemoveAt(_alerts.Count - 1);
@@ -790,7 +888,7 @@ namespace MemTray
             if (top.Count > 0)
                 text = string.Format(CultureInfo.InvariantCulture,
                     "内存 {0:0.0}% · 可用 {1:0.00} GB\n最大占用：{2} {3}",
-                    rec.Mem.Percent, rec.Mem.AvailGB, top[0].Name, Fmt.Size(top[0].Metric(rec.MetricPrivate)));
+                    rec.Mem.Percent, rec.Mem.AvailGB, top[0].Name, Fmt.Size(top[0].Metric(rec.Mode)));
             else
                 text = string.Format(CultureInfo.InvariantCulture,
                     "内存 {0:0.0}% · 可用 {1:0.00} GB", rec.Mem.Percent, rec.Mem.AvailGB);
@@ -824,13 +922,13 @@ namespace MemTray
                 string file = Path.Combine(Config.LogDir, rec.Time.ToString("yyyy-MM-dd") + ".csv");
                 StringBuilder sb = new StringBuilder();
                 if (!File.Exists(file))
-                    sb.AppendLine("时间,原因,内存使用率%,已用GB,可用GB,提交已用GB,提交上限GB,排名,程序,实例数,工作集MB,专用MB,累计CPU秒");
+                    sb.AppendLine("时间,原因,内存使用率%,已用GB,可用GB,提交已用GB,提交上限GB,排名,程序,实例数,工作集MB,专用MB,专用工作集MB,累计CPU秒");
 
                 for (int i = 0; i < rec.Top.Count; i++)
                 {
                     ProcRow r = rec.Top[i];
                     sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                        "{0},{1},{2:0.0},{3:0.00},{4:0.00},{5:0.00},{6:0.00},{7},{8},{9},{10:0.0},{11:0.0},{12:0}",
+                        "{0},{1},{2:0.0},{3:0.00},{4:0.00},{5:0.00},{6:0.00},{7},{8},{9},{10:0.0},{11:0.0},{12:0.0},{13:0}",
                         rec.Time.ToString("yyyy-MM-dd HH:mm:ss"),
                         rec.Reason,
                         rec.Mem.Percent,
@@ -843,6 +941,7 @@ namespace MemTray
                         r.Count,
                         r.WsBytes / 1048576.0,
                         r.PrivateBytes / 1048576.0,
+                        r.PwsBytes / 1048576.0,
                         r.CpuSeconds));
                 }
                 File.AppendAllText(file, sb.ToString(), new UTF8Encoding(true));
@@ -869,8 +968,8 @@ namespace MemTray
                     ProcRow r = a.Top[j];
                     sb.AppendFormat(CultureInfo.InvariantCulture, "  {0}. {1}{2}  {3}  ({4:0.0}%){5}",
                         j + 1, r.Name, r.Count > 1 ? " x" + r.Count : "",
-                        Fmt.Size(r.Metric(a.MetricPrivate)),
-                        r.Metric(a.MetricPrivate) * 100.0 / Math.Max(1.0, (double)a.Mem.Total),
+                        Fmt.Size(r.Metric(a.Mode)),
+                        r.Metric(a.Mode) * 100.0 / Math.Max(1.0, (double)a.Mem.Total),
                         Environment.NewLine);
                 }
                 sb.AppendLine();
@@ -933,7 +1032,7 @@ namespace MemTray
                     for (int i = 0; i < _top.Count && i < TopCount; i++)
                     {
                         ProcRow r = _top[i];
-                        long b = r.Metric(_cfg.UsePrivateMetric);
+                        long b = r.Metric(_cfg.Metric);
                         string label = string.Format(CultureInfo.InvariantCulture,
                             "{0}. {1}{2}   {3}", i + 1, r.Name, r.Count > 1 ? " x" + r.Count : "", Fmt.Size(b));
                         ToolStripMenuItem item = new ToolStripMenuItem(label);
@@ -968,17 +1067,29 @@ namespace MemTray
 
             _menu.Items.Add(new ToolStripSeparator());
 
-            ToolStripMenuItem metric = new ToolStripMenuItem("按专用内存统计（否则工作集）");
-            metric.Checked = _cfg.UsePrivateMetric;
-            metric.Click += delegate
-            {
-                _cfg.UsePrivateMetric = !_cfg.UsePrivateMetric;
-                _cfg.Save();
-                _top = TakeSnapshot(TopCount);
-                if (_panel.Visible)
-                    _panel.SetData(_mem, _top, _alerts, _history, _cfg, _self.PrivateMemorySize64 / 1048576.0);
+            ToolStripMenuItem metricMenu = new ToolStripMenuItem("统计口径");
+            string[] metricModes = new string[] { "ws", "private", "pws" };
+            string[] metricLabels = new string[] {
+                "工作集（与 Get-Process WS 一致）",
+                "专用内存（提交，含换出到页面文件）",
+                "专用工作集（与任务管理器内存列一致）"
             };
-            _menu.Items.Add(metric);
+            for (int i = 0; i < metricModes.Length; i++)
+            {
+                string m = metricModes[i];
+                ToolStripMenuItem mi = new ToolStripMenuItem(metricLabels[i]);
+                mi.Checked = string.Equals(_cfg.Metric, m, StringComparison.OrdinalIgnoreCase);
+                mi.Click += delegate
+                {
+                    _cfg.Metric = m;
+                    _cfg.Save();
+                    _top = TakeSnapshot(TopCount);
+                    if (_panel.Visible)
+                        _panel.SetData(_mem, _top, _alerts, _history, _cfg, _self.PrivateMemorySize64 / 1048576.0);
+                };
+                metricMenu.DropDownItems.Add(mi);
+            }
+            _menu.Items.Add(metricMenu);
 
             ToolStripMenuItem auto = new ToolStripMenuItem("开机自启");
             auto.Checked = Autostart.IsEnabled();
@@ -1433,7 +1544,7 @@ namespace MemTray
             DrawChart(g, s, pad, w);
 
             DrawText(g, string.Format(CultureInfo.InvariantCulture, "占用最大 {0} 个程序", TrayApp.TopCount), _fSection, CText, pad, 206f * s);
-            DrawTextRight(g, _cfg != null && _cfg.UsePrivateMetric ? "口径：专用内存" : "口径：工作集",
+            DrawTextRight(g, "口径：" + TrayApp.MetricName(_cfg == null ? "ws" : _cfg.Metric),
                 _fMeta, CDim, w - pad, 209f * s);
 
             DrawRows(g, s, pad, w);
@@ -1555,7 +1666,7 @@ namespace MemTray
             float rowH = 24f * s;
             float y0 = 226f * s;
             double total = _mem == null || _mem.Total == 0 ? 1 : (double)_mem.Total;
-            bool priv = _cfg != null && _cfg.UsePrivateMetric;
+            string mode = _cfg != null ? _cfg.Metric : "ws";
 
             for (int i = 0; i < TrayApp.TopCount; i++)
             {
@@ -1570,7 +1681,7 @@ namespace MemTray
                 }
 
                 ProcRow r = _rows[i];
-                long bytes = r.Metric(priv);
+                long bytes = r.Metric(mode);
                 double pct = bytes * 100.0 / total;
 
                 DrawText(g, (i + 1).ToString(CultureInfo.InvariantCulture), _fMeta, CDim, pad, y + 5 * s);
@@ -1619,7 +1730,7 @@ namespace MemTray
                 AlertRecord a = _alerts[0];
                 string who = "";
                 if (a.Top.Count > 0)
-                    who = "  ·  " + a.Top[0].Name + " " + Fmt.Size(a.Top[0].Metric(a.MetricPrivate));
+                    who = "  ·  " + a.Top[0].Name + " " + Fmt.Size(a.Top[0].Metric(a.Mode));
                 text = string.Format(CultureInfo.InvariantCulture,
                     "最近告警 {0}  ·  内存 {1:0.0}%{2}", a.Time.ToString("HH:mm:ss"), a.Mem.Percent, who);
             }
